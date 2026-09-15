@@ -1,105 +1,144 @@
-# PCIe P2P RingAllReduce 四 GPU 模拟器
+# RingAllReduce：多 Channel / SimpleBuffer 事件模拟器
 
-用 Python 容器类管理四张逻辑 GPU，模拟参考图中的 `A → D → C → B → A`。
-只用 Python 标准库；本机已找到 Python 3.12.10 和 Tkinter，不需要 pip、CUDA 或真实 GPU。
+纯 Python 标准库实现四张逻辑 GPU 的 `A → D → C → B → A` 通信。
+默认 **2 个 Channel、每条连接 2 个槽、每个 slice 1 个元素**，GPU D 每 4 个调度 sweep 消费一次。
+前 3 个算法步骤归约（ReduceScatter），后 3 个步骤复制完整结果（AllGather）。
+
+这是 CPU 上的教学模型，不调用 CUDA，不访问真实 GPU，也不预测 PCIe 性能。
 
 ## 在 VS Code 运行
 
-1. 打开 `D:\RingAllReduce` 文件夹。
-2. 按 **Ctrl+Shift+B**，启动图形模拟器。这条任务直接调用本机 Python，无需 Python 扩展。
-3. 点击“下一步”查看六轮通信；“上一步”回看已保存状态；“重置”重新开始。
-4. 如已安装 Python Debugger 扩展，也可按 **F5**，选择“RingAllReduce 图形模拟器”。
-
-VS Code 集成终端（PowerShell）也可直接执行：
+打开 `D:\RingAllReduce`，按 **Ctrl+Shift+B** 启动图形界面。
+已有 `.vscode/tasks.json` 直接调用本机 Python，无需额外依赖；安装 Python Debugger 扩展后也可以 F5 调试。
 
 ```powershell
 & 'C:\Users\xiaoqiandai\AppData\Local\Programs\Python\Python312\python.exe' .\main.py
+# 命令行逐事件执行：
 & 'C:\Users\xiaoqiandai\AppData\Local\Programs\Python\Python312\python.exe' .\main.py --cli --step
-& 'C:\Users\xiaoqiandai\AppData\Local\Programs\Python\Python312\python.exe' .\main.py --cli --input examples/input.json --export traces/demo.json
+# 使用示例输入，导出完整事件历史：
+& 'C:\Users\xiaoqiandai\AppData\Local\Programs\Python\Python312\python.exe' .\main.py --cli --quiet --input examples/input.json --export traces/channels.json
+# 以算法轮次为观察节点，底层仍逐事件运行：
+& 'C:\Users\xiaoqiandai\AppData\Local\Programs\Python\Python312\python.exe' .\main.py --cli --rounds
+# 测试：
 & 'C:\Users\xiaoqiandai\AppData\Local\Programs\Python\Python312\python.exe' -m unittest discover -s tests -v
 ```
 
-解释器路径是本机配置；换电脑时修改 `.vscode/settings.json`、`.vscode/tasks.json`。
+如果 Python 已加入 PATH，可直接使用 `python main.py`。换电脑时需调整 `.vscode/settings.json` 和 `tasks.json` 中的解释器路径。
 
-## 容器类与数据流
+## 界面怎么看
+
+1. **下一事件**：执行一次发送、接收或等待；不会自动清空 Buffer。
+2. **上一事件**：回看不可变的历史快照；不会回滚或再次执行算法。
+3. **推进一轮**：快进到所有 Channel 至少完成下一个轮次；不向算法插入屏障。
+4. **运行到结束**：完成剩余事件并验证每张卡的最终结果。
+5. **图中 Channel**：切换查看不同数据范围。下表同时列出所有 Channel 的链路。
+6. **点击链路行**：查看该 Channel / 连接独有的 SimpleBuffer 槽位。
+7. **应用并重置**：调整 Channel 数、槽数、slice 长度、慢卡和接收周期后重新运行。
+
+每块的“完成 x/y slice”表示已经包含全部四张卡贡献的小段数量。
+绿色表示该 chunk 全部归约完成，蓝色边框表示本事件更新的接收块。
+表中轮次 7 表示该发送方或接收方已经完成 6 轮；发送和接收进度可以不同。
+表中的状态是该 actor 最近一次尝试结果，不是硬件状态寄存器。
+
+## 结构与术语
 
 ```text
 GPUContainer
-├── gpus[rank]: GPU             原始块、工作块、NUMA 标签
-├── links[source]: PCIeLink     后继 GPU、假设的路径、发送元素计数
-│   └── buffer: RingBuffer      有限槽位、单调 head/tail
-├── step()                     推进一个逻辑通信轮次
-├── run()                      执行剩余轮次
-├── history                    初始状态 + 每轮数据及传输记录
-└── verify()                   与逐元素直接求和对比
+├── GPU[0..3]：输入与 NUMA 标签
+├── Channel[0..C-1]：互不重叠的连续输入范围
+│   ├── 每卡 4 个算法 chunk
+│   │   └── 每 chunk 拆为若干 slice
+│   └── 四条有向 PCIeLink
+│       └── 各自独立的接收 SimpleBuffer
+│           ├── slots[capacity]：每槽至多 slice_elements 个数值
+│           ├── head：已消费的小段计数
+│           └── tail：已发布的小段计数
+└── 公平交错的 send / recv 事件调度器
 ```
 
-`Chunk` 是不可变的数据块，`contributors` 记录哪些 Rank 已经参与求和。
-`reduce_with()` 检查来源集合，防止重复加上同一张卡的数据。
+- **chunk**：算法调度的数据块；每个 Channel 按四卡划分为 4 块。
+- **slice**：一个 chunk 中实际传输的小段，带有来源 Rank 集合。
+- **slot**：Buffer 中可复用的存储位置；不是一个独立数据块的永久位置。
+- **Channel**：软件并发通道，不等于独占的 PCIe lane。
+
+默认输入每卡 32 个元素：C0 处理 `[0,16)`，C1 处理 `[16,32)`。
+每 Channel 的 chunk 长度 4，再切成 4 个长度为 1 的 slice。
+非整除输入在每 Channel 内补零，最终按该 Channel 的有效长度裁剪并拼接。
+空 Channel 不产生数据传输，避免重复处理其他 Channel 的数据。
+
+## SimpleBuffer 和等待
+
+```text
+发送：若 tail-head == capacity → WAIT_FULL
+      否则先写 slots[tail % capacity]，再推进 tail
+
+接收：若 head == tail → WAIT_EMPTY
+      若慢卡尚未到消费时机 → WAIT_DELAY
+      否则读取并计算，保存结果后再推进 head
+```
+
+发送下一轮某个 slice 时，还必须等上一跳对应 slice 到达，否则出现 `WAIT_DEPENDENCY`。
+满 Buffer 不覆盖旧数据，也不推进发送游标；一个槽释放后可以继续发送。
+`head`、`tail` 单调增长，只有物理槽位索引对 capacity 取模。
+
+默认示例确实会出现：**SEND → Buffer 满 → WAIT_FULL → RECV 释放 head → SEND 复用槽位**。
+把接收周期改为 1 可以去掉人为接收延迟；是否出现其他等待还取决于依赖和槽数。
+
+## 调度与流水化
+
+每个 sweep（界面中称 tick）公平地给每条连接的发送、接收 actor 一次机会，Channel 按环位置交错安排。
+`receive_period=4` 表示选定慢卡只在 tick 为 4 的倍数时消费，每次至多一个 slice。
+这是为了演示背压的确定性规则，**tick 不代表秒数，周期也不是 GPU 性能参数**。
+
+每条连接维护自己的发送轮次、小段游标和接收游标。
+所有发送内容只来自本地已经就绪的 slice；ReduceScatter 恰好加入一次本卡贡献；AllGather 不再加法。
+一张卡收到上游小段后就能在满足本地发送顺序时继续转发，无需等待全局所有卡或所有 Channel 完成本轮。
+同一 Channel 的发送仍按 chunk/slice 顺序推进，不模拟任意乱序执行。
+
+默认 NUMA 标签为 A/B 在结点 0，C/D 在结点 1，假设所有环边都支持 P2P。
+模型不探测真实拓扑，不模拟 PCIe 链路争用或 DMA，也不实现真实内存屏障、LL128、RAS、L3 或设备地址映射。
+
+## Python API
 
 ```python
 from simulator import GPUContainer, demo_inputs
 
-cluster = GPUContainer(demo_inputs())
-round_one = cluster.step()
-for event in round_one['transfers']:
-    print(event['source'], '->', event['target'], event['payload'])
+cluster = GPUContainer(demo_inputs(), nchannels=2,
+                       buffer_slots=2, slice_elements=1,
+                       slow_rank=3, receive_period=4)
+snapshot = cluster.step_event()
+print(snapshot['event'])
+cluster.step_round()
 results = cluster.run()
 assert cluster.verify()
 print(results[0])
 ```
 
-默认各卡输入 8 个元素，每块 2 个元素。结果：
-`[100, 104, 108, 112, 116, 120, 124, 128]`，四张卡都获得同一数组。
+默认最终结果为 `[100,104,108,...,224]`，每张 GPU 一致。
+总共 192 次 SEND、96 次 RECV_REDUCE、96 次 RECV_COPY，等待事件另计。
+每卡总发送 48 个数值元素；这是两个 Channel 的发送量相加，包含补零时也会计入补零数据。
 
-## 六轮调度
+可以用 `receive_periods={(0,3):7}` 覆盖某个 Channel 上某个接收 Rank 的周期，观察两个 Channel 进度分离。
+设置 `cluster.channels[0].links[0].p2p_enabled = False` 会明确报错，不会静默走主机中转。
 
-每一轮的四条边并行推进。下表标的是该边本轮发送的块编号。
+### 与第一版的 API 差异
 
-| 轮次 | 阶段 | A→D | D→C | C→B | B→A |
-|---|---|---|---|---|---|
-| 1 | ReduceScatter | 1 | 0 | 3 | 2 |
-| 2 | ReduceScatter | 2 | 1 | 0 | 3 |
-| 3 | ReduceScatter | 3 | 2 | 1 | 0 |
-| 4 | AllGather | 0 | 3 | 2 | 1 |
-| 5 | AllGather | 1 | 0 | 3 | 2 |
-| 6 | AllGather | 2 | 1 | 0 | 3 |
+- `step()` 现在等价于 `step_event()`；整轮观察请用 `step_round()`。
+- `links` 位于 `cluster.channels[channel_id].links[source_rank]`。
+- GUI / JSON 记录每次事件，JSON `schema_version` 为 2。
+- 默认输入由每卡 8 个改为 32 个元素，使一个 chunk 能装满小 Buffer 并产生背压。
+- `record_history=False` 可用于较大输入的纯计算检查，避免保存每一步的完整快照。此模式不用于 GUI。
+- GUI 回看旧事件后导出的是完整已执行历史，`viewed_event` 标出正在查看的事件。
 
-第 3 轮结束时 A/B/C/D 分别拥有完整的 0/1/2/3 号结果块。
-后 3 轮只复制结果，不再做加法。
-
-`step()` 先捕获四个发送载荷并写入各接收 FIFO，再统一消费并更新 GPU。
-因此循环遍历 GPU 的先后顺序不会把本轮刚收到的数据再次作为本轮发送数据。
-真实硬件会按更细粒度流水化；这里的轮次边界是为了讲解，并非硬件全局屏障。
-
-## Buffer 与 NUMA
-
-每条有向连接有自己的接收 FIFO，默认 2 个槽，每槽存一块模拟数据。
-发送前要求 `tail - head < capacity`，槽位为 `tail % capacity`。
-先写数据再推进 tail；接收要求 `head < tail`，消费后推进 head。
-GUI 展示“发送前 → 写入后 → 消费后”的计数，能看到循环复用槽位。
-主算法每轮将队列排空；满队列等待由 Buffer 的单元测试演示，不模拟线程竞争。
-
-示例 NUMA 放置：A/B 在结点 0，C/D 在结点 1。A→D、C→B 跨 NUMA。
-假设这四条边均支持 PCIe P2P；不读取本机拓扑，也不声称跨 NUMA 必然支持 P2P。
-可以设置 `cluster.links[0].p2p_enabled = False` 查看明确错误，不会静默改用主机中转。
-
-## 模型边界
-
-- 支持四卡等长非空数值数组；非 4 的倍数会补零，最终结果裁去补零。
-- 接受有限实数；整数结果精确比较，浮点结果按容差比较。
-- 本模型不量化带宽、时延、PCIe 争用，不模拟真实 DMA、内存屏障或缓存一致性。
-- 不实现 NCCL channel/LL128、多进程通信或 GPU kernel；`RingBuffer` 为教学模型。
-- 图形界面可能缩略显示长数据块；命令行和 JSON 保留完整值。
-- 不需要 GitHub 登录；项目不保存账号、密码或令牌。
+完整历史随输入和事件数量增长；本项目面向小规模教学演示。CLI 不导出时默认不保存历史。
 
 ## 文件
 
-- `simulator.py`：容器、设备、链路、缓冲区和算法。
-- `gui.py`：图形过程展示。
-- `main.py`：GUI / CLI 入口。
-- `tests/test_simulator.py`：算法、环排列、补零、浮点数、FIFO 和错误情况测试。
-- `examples/input.json`：可修改的四卡输入。
-- `.vscode/`：运行任务与调试配置。
+- `simulator.py`：GPUContainer、Channel、Slice、SimpleBuffer 和事件调度。
+- `gui.py`：Channel 视图、链路表、槽位图和历史回看。
+- `main.py`：GUI / CLI 入口与参数。
+- `tests/test_simulator.py`：排列、分片、背压、依赖、独立进度、FIFO 与错误处理。
+- `examples/input.json`：四卡输入。
+- `.vscode/`：本机运行任务与调试配置。
 
-项目目录原有图片作为参考保留，程序不修改它们。
+项目原有参考图片保留。项目不保存账号、密码或令牌。

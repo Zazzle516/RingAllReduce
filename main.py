@@ -1,4 +1,4 @@
-"""Run with python main.py (GUI), or python main.py --cli."""
+"""GUI by default; --cli exposes the same event scheduler in a terminal."""
 import argparse
 import json
 from pathlib import Path
@@ -7,59 +7,76 @@ import sys
 from simulator import GPUContainer, demo_inputs
 
 
-def print_round(state: dict) -> None:
-    print(f"\n=== Round {state['round']} / 6 : {state['phase']} ===")
-    for event in state["transfers"]:
-        src, dst = chr(65 + event['source']), chr(65 + event['target'])
-        print(f"  {src} -> {dst}  chunk {event['chunk']}  "
-              f"{event['payload']['values']} -> {event['result']['values']}")
-        print(f"    {event['operation']} | {event['route']} | slot {event['slot']}")
-        print(f"    head/tail: {event['before']} -> {event['published']} -> {event['consumed']}")
-    for gpu in state['gpus'].values():
-        print(f"  GPU {gpu['name']}: " + " | ".join(str(c['values']) for c in gpu['chunks']))
+def format_event(state):
+    e = state['event']
+    before, after = e['before'], e['after']
+    text = (f"#{e['id']:04} tick={e['tick']:03} C{e['channel']} "
+            f"{chr(65+e['source'])}->{chr(65+e['target'])} "
+            f"R{e['round']} chunk={e['chunk']} slice={e['part']} {e['kind']} "
+            f"H/T {before['head']}/{before['tail']} -> {after['head']}/{after['tail']}")
+    if 'payload' in e:
+        text += f" values={e['payload']['values']}"
+    if 'result' in e:
+        text += f" result={e['result']['values']}"
+    return text
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Four-GPU PCIe P2P RingAllReduce CPU simulator")
-    parser.add_argument("--cli", action="store_true", help="Print all rounds in the terminal")
-    parser.add_argument("--step", action="store_true", help="CLI: press Enter between rounds")
-    parser.add_argument("--input", type=Path, help="JSON file containing four equal-length arrays")
-    parser.add_argument("--export", type=Path, help="CLI: write full JSON trace to this file")
+def main():
+    parser = argparse.ArgumentParser(description="Four-GPU multi-channel SimpleBuffer simulator")
+    parser.add_argument('--cli', action='store_true')
+    parser.add_argument('--step', action='store_true', help='CLI: Enter advances one event')
+    parser.add_argument('--rounds', action='store_true', help='CLI: advance to next common round milestone')
+    parser.add_argument('--channels', type=int, default=2)
+    parser.add_argument('--buffer-slots', type=int, default=2)
+    parser.add_argument('--slice-elements', type=int, default=1)
+    parser.add_argument('--slow-rank', type=int, default=3, choices=range(4))
+    parser.add_argument('--receive-period', type=int, default=4,
+                        help='Slow GPU consumes once every N scheduler sweeps; 1 disables delay')
+    parser.add_argument('--input', type=Path)
+    parser.add_argument('--export', type=Path)
+    parser.add_argument('--quiet', action='store_true', help='CLI: show final summary only')
     args = parser.parse_args()
-    if args.step and not args.cli:
-        parser.error("--step requires --cli")
-    if args.export and not args.cli:
-        parser.error("--export requires --cli; the GUI has its own export button")
+    if not args.cli and any((args.step, args.rounds, args.export, args.quiet)):
+        parser.error('--step/--rounds/--export/--quiet require --cli')
     try:
-        inputs = json.loads(args.input.read_text(encoding="utf-8-sig")) if args.input else demo_inputs()
-        container = GPUContainer(inputs)
-    except (OSError, ValueError, TypeError) as exc:
+        data = json.loads(args.input.read_text(encoding='utf-8-sig')) if args.input else demo_inputs()
+        sim = GPUContainer(data, nchannels=args.channels, buffer_slots=args.buffer_slots,
+                           slice_elements=args.slice_elements, slow_rank=args.slow_rank,
+                           receive_period=args.receive_period,
+                           record_history=not args.cli or bool(args.export))
+    except (ValueError, TypeError, OSError, KeyError) as exc:
         parser.error(str(exc))
     if args.cli:
-        print("CPU-only simulation | assumed PCIe P2P | A -> D -> C -> B -> A")
-        print(f"Elements per GPU: {container.size}; padded: {container.padded_size}")
-        print_round(container.history[0])
-        while not container.done:
+        print(f"CPU simulation | {sim.nchannels} channels | slots={sim.buffer_slots} | "
+              f"slice elements={sim.slice_elements} | input/padded={sim.size}/{sim.padded_size}")
+        for c in sim.channels:
+            print(f"Channel {c.id}: [{c.start}, {c.stop}), chunk={c.chunk_size}, slices/chunk={c.parts}")
+        while not sim.done:
             if args.step:
-                input("Press Enter for the next round...")
-            print_round(container.step())
-        print(f"\nExpected: {container.expected}")
-        ok = container.verify()
-        print("Verification: " + ("PASS" if ok else "FAIL"))
-        print(f"Sent per GPU: {6 * container.chunk_size} simulated elements")
+                input('Enter: next ' + ('round milestone' if args.rounds else 'event') + '...')
+            state = sim.step_round() if args.rounds else sim.step_event()
+            if not args.quiet:
+                print(format_event(state))
+                if args.rounds:
+                    print(f"All channels have completed at least round {sim.round}")
+        ok = sim.verify()
+        print('Verification: ' + ('PASS' if ok else 'FAIL'))
+        print('Result:', sim.results[0])
+        print('Events:', sim.event_id, sim.counts)
+        print('Sent elements per GPU:', {r: sum(c.links[r].elements_sent for c in sim.channels) for r in sim.ring})
         if args.export:
             args.export.parent.mkdir(parents=True, exist_ok=True)
-            args.export.write_text(json.dumps(container.trace(), indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"Trace: {args.export.resolve()}")
+            args.export.write_text(json.dumps(sim.trace(), ensure_ascii=False, indent=2), encoding='utf-8')
+            print('Trace:', args.export.resolve())
         return 0 if ok else 1
     try:
         from gui import launch
-        launch(container)
     except ImportError:
-        print("Tkinter is unavailable. Use: python main.py --cli", file=sys.stderr)
+        print('Tkinter unavailable. Use python main.py --cli', file=sys.stderr)
         return 1
+    launch(sim)
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

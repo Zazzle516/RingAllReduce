@@ -11,11 +11,14 @@
       "justMyCode": true
     },
     {
-      "name": "RingAllReduce 命令行逐轮运行",
+      "name": "RingAllReduce 命令行逐事件运行",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/main.py",
-      "args": ["--cli", "--step"],
+      "args": [
+        "--cli",
+        "--step"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true

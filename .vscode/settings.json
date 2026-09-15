@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "C:/Users/xiaoqiandai/AppData/Local/Programs/Python/Python312/python.exe",
+  "python.testing.unittestEnabled": true,
+  "python.testing.pytestEnabled": false,
+  "python.testing.unittestArgs": ["-v", "-s", "tests", "-p", "test_*.py"],
+  "files.encoding": "utf8"
+}

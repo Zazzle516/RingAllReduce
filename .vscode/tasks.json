@@ -1,0 +1,23 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "RingAllReduce: 图形界面",
+      "type": "process",
+      "command": "C:/Users/xiaoqiandai/AppData/Local/Programs/Python/Python312/python.exe",
+      "args": ["${workspaceFolder}/main.py"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": [],
+      "group": {"kind": "build", "isDefault": true}
+    },
+    {
+      "label": "RingAllReduce: 测试",
+      "type": "process",
+      "command": "C:/Users/xiaoqiandai/AppData/Local/Programs/Python/Python312/python.exe",
+      "args": ["-m", "unittest", "discover", "-s", "tests", "-v"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": [],
+      "group": "test"
+    }
+  ]
+}

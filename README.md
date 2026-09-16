@@ -40,21 +40,155 @@
 表中轮次 7 表示该发送方或接收方已经完成 6 轮；发送和接收进度可以不同。
 表中的状态是该 actor 最近一次尝试结果，不是硬件状态寄存器。
 
+## 类关系图（Mermaid）
+
+下图对应当前 `simulator.py` 与 `gui.py` 中的业务类，仅列出主要字段和方法。
+数量表示 `reset()` 完成后的状态；`nchannels` 是配置的通道数。
+
+```mermaid
+classDiagram
+    direction TB
+
+    class SimulatorWindow {
+        +simulator
+        +view
+        +next()
+        +refresh()
+        +draw()
+    }
+    class RingAllReduceSimulator {
+        +gpus
+        +channels
+        +scheduler
+        +history
+        +reset()
+        +step_event()
+        +run()
+        +snapshot()
+        +verify()
+    }
+    class GPU {
+        +rank
+        +numa_node
+        +input_values
+        +channels
+    }
+    class GPUChannelState {
+        +original
+        +data
+        +recv_buffer
+        +send_link
+        +recv_link
+        +create(gpu, channel, buffer_slots)
+        +attempt(channel, action, tick)
+    }
+    class Channel {
+        <<immutable>>
+        +id
+        +start
+        +stop
+        +ring
+        +slice_elements
+        +chunk_index(source, round_id)
+    }
+    class Scheduler {
+        +gpus
+        +channels
+        +actors
+        +cursor
+        +sweep
+        +event_id
+        +step_event()
+        +completed_round(channel_id)
+    }
+    class PCIeLink {
+        +source
+        +target
+        +buffer
+        +send_round
+        +send_part
+        +recv_round
+        +recv_part
+        +receive_period
+    }
+    class SimpleBuffer {
+        +capacity
+        +head
+        +tail
+        +slots
+        +push(packet)
+        +peek()
+        +pop()
+    }
+    class Slice {
+        <<immutable>>
+        +channel
+        +chunk
+        +part
+        +offset
+        +values
+        +contributors
+        +round
+    }
+
+    SimulatorWindow --> "1" RingAllReduceSimulator : simulator / 调用并显示快照
+    RingAllReduceSimulator "1" *-- "4" GPU : gpus
+    RingAllReduceSimulator "1" *-- "nchannels" Channel : channels
+    RingAllReduceSimulator "1" *-- "1" Scheduler : scheduler
+    GPU "1" *-- "nchannels" GPUChannelState : channels
+    GPUChannelState "1" *-- "1" SimpleBuffer : recv_buffer
+    GPUChannelState --> "1" PCIeLink : send_link
+    GPUChannelState --> "1" PCIeLink : recv_link
+    PCIeLink --> "1" SimpleBuffer : buffer / 引用接收方缓冲区
+    GPUChannelState --> "0..*" Slice : data中的本地结果
+    SimpleBuffer --> "0..*" Slice : slots中的在途数据
+    Scheduler --> "4" GPU : 引用已有GPU
+    Scheduler --> "nchannels" Channel : 引用已有配置
+    Scheduler ..> GPUChannelState : 调用attempt
+    GPUChannelState ..> Channel : 使用方法参数中的配置
+```
+
+- `*--`：组合，表示本项目中的创建与归属关系；不表示 Python 的强制销毁规则。
+- `-->`：持有对象引用。`..>`：调用或临时使用；没有保存为该对象的字段。
+- `Channel` 和 `Slice` 是不可变数据类；图中的类之间没有继承关系。
+- 每张 GPU 有 `nchannels` 份独立的 `GPUChannelState`，但所有 GPU 使用同一组 `Channel` 配置。
+- 每条有向连接由发送方的 `send_link` 和接收方的 `recv_link` 共同引用；每个 channel 总共 4 条连接、4 个接收 buffer。
+- `PCIeLink.source/target` 保存 rank 整数，不直接持有 GPU 对象；GPU 和 Scheduler 均不反向持有模拟器。
+- `main.py` 是函数入口，测试文件中的类用于验证，不属于运行时业务对象图。
+
+例如默认环中的 `A → D`，下面三个表达式引用同一份接收缓冲区：
+
+```python
+sender = simulator.gpus[0].channels[0]
+receiver = simulator.gpus[3].channels[0]
+assert sender.send_link is receiver.recv_link
+assert sender.send_link.buffer is receiver.recv_buffer
+assert receiver.recv_link.buffer is receiver.recv_buffer
+```
+
 ## 结构与术语
 
 ```text
-GPUContainer
-├── GPU[0..3]：输入与 NUMA 标签
-├── Channel[0..C-1]：互不重叠的连续输入范围
-│   ├── 每卡 4 个算法 chunk
-│   │   └── 每 chunk 拆为若干 slice
-│   └── 四条有向 PCIeLink
-│       └── 各自独立的接收 SimpleBuffer
-│           ├── slots[capacity]：每槽至多 slice_elements 个数值
-│           ├── head：已消费的小段计数
-│           └── tail：已发布的小段计数
-└── 公平交错的 send / recv 事件调度器
+RingAllReduceSimulator
+├── gpus[rank] → GPU：输入与 NUMA 标签
+│   └── channels[channel_id] → GPUChannelState
+│       ├── original：本卡在此 channel 的原始输入（补零后）
+│       ├── data[chunk][part]：本卡的中间结果
+│       ├── recv_buffer → SimpleBuffer：本卡接收缓冲区
+│       │   └── slots、head、tail
+│       ├── send_link → PCIeLink：指向下一张卡的接收 buffer
+│       └── recv_link → PCIeLink：与上一张卡的 send_link 为同一对象
+├── channels → Channel：不可变的数据划分、chunk/slice 大小、环顺序
+└── scheduler → Scheduler：公平交错推进各 GPU 的 send / recv
 ```
+
+GPU 不反向引用模拟器。Scheduler 引用 GPU 和 Channel 配置，调用
+`GPUChannelState.attempt()` 执行本地发送或接收；可变数据仅保存在对应 GPU 上。
+每条连接由两端共享，`send_link.buffer` 就是下游的 `recv_buffer`，不复制缓冲区。
+
+GUI 调用链：`SimulatorWindow.next()` → `RingAllReduceSimulator.step_event()` →
+`Scheduler.step_event()` → `GPUChannelState.attempt()` → `SimpleBuffer.push()/pop()`。
+随后模拟器保存快照，GUI 刷新。直接调用 scheduler 不记录 GUI 历史，日常运行应使用模拟器接口。
 
 - **chunk**：算法调度的数据块；每个 Channel 按四卡划分为 4 块。
 - **slice**：一个 chunk 中实际传输的小段，带有来源 Rank 集合。
@@ -101,16 +235,16 @@ GPUContainer
 ## Python API
 
 ```python
-from simulator import GPUContainer, demo_inputs
+from simulator import RingAllReduceSimulator, demo_inputs
 
-cluster = GPUContainer(demo_inputs(), nchannels=2,
+simulator = RingAllReduceSimulator(demo_inputs(), nchannels=2,
                        buffer_slots=2, slice_elements=1,
                        slow_rank=3, receive_period=4)
-snapshot = cluster.step_event()
+snapshot = simulator.step_event()
 print(snapshot['event'])
-cluster.step_round()
-results = cluster.run()
-assert cluster.verify()
+simulator.step_round()
+results = simulator.run()
+assert simulator.verify()
 print(results[0])
 ```
 
@@ -119,12 +253,27 @@ print(results[0])
 每卡总发送 48 个数值元素；这是两个 Channel 的发送量相加，包含补零时也会计入补零数据。
 
 可以用 `receive_periods={(0,3):7}` 覆盖某个 Channel 上某个接收 Rank 的周期，观察两个 Channel 进度分离。
-设置 `cluster.channels[0].links[0].p2p_enabled = False` 会明确报错，不会静默走主机中转。
+设置 `simulator.gpus[0].channels[0].send_link.p2p_enabled = False` 会明确报错，不会静默走主机中转。
+
+查看某张卡的 channel 状态：
+
+```python
+local = simulator.gpus[3].channels[0]  # GPU D 的 channel 0
+print(local.data[1][0])            # chunk 1 的第一个 slice
+print(local.recv_buffer.head, local.recv_buffer.tail)
+assert simulator.gpus[0].channels[0].send_link is local.recv_link
+assert local.recv_link.buffer is local.recv_buffer
+print(simulator.scheduler.completed_round(0))
+```
+
+本次重构移除了 `Channel.data/original/links`：数据改从 GPU 的本地状态读取；
+channel 进度通过 `simulator.scheduler.completed_round(channel_id)` 查询。
+GUI、CLI 和 JSON 快照结构保持兼容，`schema_version` 仍为 2。
 
 ### 与第一版的 API 差异
 
 - `step()` 现在等价于 `step_event()`；整轮观察请用 `step_round()`。
-- `links` 位于 `cluster.channels[channel_id].links[source_rank]`。
+- 连接位于 `simulator.gpus[rank].channels[channel_id].send_link/recv_link`。
 - GUI / JSON 记录每次事件，JSON `schema_version` 为 2。
 - 默认输入由每卡 8 个改为 32 个元素，使一个 chunk 能装满小 Buffer 并产生背压。
 - `record_history=False` 可用于较大输入的纯计算检查，避免保存每一步的完整快照。此模式不用于 GUI。
@@ -134,7 +283,7 @@ print(results[0])
 
 ## 文件
 
-- `simulator.py`：GPUContainer、Channel、Slice、SimpleBuffer 和事件调度。
+- `simulator.py`：RingAllReduceSimulator、GPU、GPUChannelState、Channel、PCIeLink、Slice、SimpleBuffer、Scheduler。
 - `gui.py`：Channel 视图、链路表、槽位图和历史回看。
 - `main.py`：GUI / CLI 入口与参数。
 - `tests/test_simulator.py`：排列、分片、背压、依赖、独立进度、FIFO 与错误处理。

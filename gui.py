@@ -3,7 +3,7 @@ import json
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from simulator import GPUContainer
+from simulator import RingAllReduceSimulator
 from main import format_event
 
 LABELS = {'SEND': '写入并发布 tail', 'RECV_REDUCE': '接收＋归约，释放 head',
@@ -13,27 +13,27 @@ LABELS = {'SEND': '写入并发布 tail', 'RECV_REDUCE': '接收＋归约，释�
 
 
 class SimulatorWindow:
-    def __init__(self, root, container):
-        self.root, self.container = root, container
+    def __init__(self, root, simulator: RingAllReduceSimulator):
+        self.root, self.simulator = root, simulator
         self.view = 0
         self.selected_channel = 0
-        self.selected_source = container.ring[0]
+        self.selected_source = simulator.ring[0]
         root.title('RingAllReduce · Channel / SimpleBuffer 事件模拟器')
         root.geometry('1200x980')
         root.minsize(1050, 900)
         settings = ttk.Frame(root, padding=(10, 8))
         settings.pack(fill='x')
         self.settings = {}
-        for name, title, value, low, high in [('nchannels', 'Channels', container.nchannels, 1, 8),
-                ('buffer_slots', '槽数', container.buffer_slots, 1, 16),
-                ('slice_elements', '每 slice 元素', container.slice_elements, 1, 32),
-                ('receive_period', '慢卡接收周期', container.receive_period, 1, 16)]:
+        for name, title, value, low, high in [('nchannels', 'Channels', simulator.nchannels, 1, 8),
+                ('buffer_slots', '槽数', simulator.buffer_slots, 1, 16),
+                ('slice_elements', '每 slice 元素', simulator.slice_elements, 1, 32),
+                ('receive_period', '慢卡接收周期', simulator.receive_period, 1, 16)]:
             ttk.Label(settings, text=title).pack(side='left', padx=(7, 3))
             var = tk.StringVar(value=str(value))
             self.settings[name] = var
             ttk.Spinbox(settings, from_=low, to=high, textvariable=var, width=4).pack(side='left')
         ttk.Label(settings, text='慢卡').pack(side='left', padx=6)
-        self.slow = tk.StringVar(value=str(container.slow_rank if container.slow_rank is not None else 3))
+        self.slow = tk.StringVar(value=str(simulator.slow_rank if simulator.slow_rank is not None else 3))
         ttk.Combobox(settings, textvariable=self.slow, values=('0', '1', '2', '3'), width=3,
                      state='readonly').pack(side='left')
         ttk.Button(settings, text='应用并重置', command=self.apply_settings).pack(side='left', padx=8)
@@ -50,7 +50,7 @@ class SimulatorWindow:
         ttk.Label(toolbar, text='图中 Channel').pack(side='left', padx=(12, 3))
         self.channel_var = tk.StringVar(value='0')
         self.channel_picker = ttk.Combobox(toolbar, textvariable=self.channel_var,
-                       values=tuple(str(i) for i in range(container.nchannels)), width=4, state='readonly')
+                       values=tuple(str(i) for i in range(simulator.nchannels)), width=4, state='readonly')
         self.channel_picker.pack(side='left')
         self.channel_picker.bind('<<ComboboxSelected>>', self.change_channel)
         self.status, self.detail = tk.StringVar(), tk.StringVar()
@@ -94,12 +94,12 @@ class SimulatorWindow:
             options = {k: int(v.get()) for k, v in self.settings.items()}
             if options['nchannels'] > 8 or options['buffer_slots'] > 16:
                 raise ValueError('图形界面最多 8 个 Channel、16 个槽；更大配置请用命令行。')
-            self.container = GPUContainer(self.container.inputs, ring=self.container.ring,
-                 numa_nodes=self.container.numa_nodes, slow_rank=int(self.slow.get()), **options)
+            self.simulator = RingAllReduceSimulator(self.simulator.inputs, ring=self.simulator.ring,
+                 numa_nodes=self.simulator.numa_nodes, slow_rank=int(self.slow.get()), **options)
         except (TypeError, ValueError) as exc:
             messagebox.showerror('配置无效', str(exc), parent=self.root)
             return
-        self.channel_picker.configure(values=tuple(str(i) for i in range(self.container.nchannels)))
+        self.channel_picker.configure(values=tuple(str(i) for i in range(self.simulator.nchannels)))
         self.selected_channel = 0
         self.channel_var.set('0')
         self.view = 0
@@ -110,34 +110,34 @@ class SimulatorWindow:
         self.refresh()
 
     def next(self):
-        if self.view < len(self.container.history)-1:
+        if self.view < len(self.simulator.history)-1:
             self.view += 1
-        elif not self.container.done:
-            self.container.step_event()
+        elif not self.simulator.done:
+            self.simulator.step_event()
             self.view += 1
         self.refresh()
 
     def next_round(self):
-        target = self.container.history[self.view]['round']+1
+        target = self.simulator.history[self.view]['round']+1
         if target > 6:
             return
-        while self.view < len(self.container.history)-1:
+        while self.view < len(self.simulator.history)-1:
             self.view += 1
-            if self.container.history[self.view]['round'] >= target:
+            if self.simulator.history[self.view]['round'] >= target:
                 self.refresh()
                 return
-        while not self.container.done and self.container.round < target:
-            self.container.step_event()
-        self.view = len(self.container.history)-1
+        while not self.simulator.done and self.simulator.round < target:
+            self.simulator.step_event()
+        self.view = len(self.simulator.history)-1
         self.refresh()
 
     def finish(self):
-        self.container.run()
-        self.view = len(self.container.history)-1
+        self.simulator.run()
+        self.view = len(self.simulator.history)-1
         self.refresh()
 
     def reset(self):
-        self.container.reset()
+        self.simulator.reset()
         self.view = 0
         self.refresh()
 
@@ -147,14 +147,14 @@ class SimulatorWindow:
         if path:
             try:
                 with open(path, 'w', encoding='utf-8') as output:
-                    trace = self.container.trace()
+                    trace = self.simulator.trace()
                     trace['viewed_event'] = self.view
                     json.dump(trace, output, indent=2, ensure_ascii=False)
             except OSError as exc:
                 messagebox.showerror('导出失败', str(exc), parent=self.root)
 
     def refresh(self):
-        state = self.container.history[self.view]
+        state = self.simulator.history[self.view]
         progress = '  |  '.join(f"C{c['id']}: R{c['completed_round']}/6" for c in state['channels'])
         self.status.set(f"事件 {state['event_id']} · 调度 tick {state['tick']}  |  {progress}")
         event = state['event']
@@ -163,7 +163,7 @@ class SimulatorWindow:
             self.detail.set(f"C{event['channel']} {chr(65+event['source'])}→{chr(65+event['target'])} "
                 f"R{event['round']} chunk {event['chunk']} / slice {event['part']}：{LABELS[event['kind']]}；"
                 f"H/T {before['head']}/{before['tail']} → {after['head']}/{after['tail']}" +
-                ('；最终校验 PASS' if state['done'] and self.container.verify() else ''))
+                ('；最终校验 PASS' if state['done'] and self.simulator.verify() else ''))
         else:
             self.detail.set('单线程交错调度；tick 不是物理时间。各 Channel 独立推进。点击下表选择一条连接查看槽位。')
         self.previous.configure(state='normal' if self.view else 'disabled')
@@ -186,7 +186,7 @@ class SimulatorWindow:
                 self.link_table.delete(key)
         self.log.configure(state='normal')
         self.log.delete('1.0', 'end')
-        for old in self.container.history[max(1, self.view-3):self.view+1]:
+        for old in self.simulator.history[max(1, self.view-3):self.view+1]:
             self.log.insert('end', format_event(old)+'\n')
         self.log.configure(state='disabled')
         self.draw()
@@ -195,7 +195,7 @@ class SimulatorWindow:
     def draw(self):
         if not hasattr(self, 'slots_canvas'):
             return
-        state = self.container.history[self.view]
+        state = self.simulator.history[self.view]
         c = state['channels'][self.selected_channel]
         event = state['event']
         canvas = self.canvas
@@ -208,7 +208,7 @@ class SimulatorWindow:
                  (right+bw/2, top+bh+5, right+bw/2, bottom-5),
                  (right-7, bottom+75, left+bw+7, bottom+75),
                  (left+bw/2, bottom-5, left+bw/2, top+bh+5)]
-        for pos, source in enumerate(self.container.ring):
+        for pos, source in enumerate(self.simulator.ring):
             active = bool(event and event['channel'] == c['id'] and event['source'] == source)
             canvas.create_line(*edges[pos], arrow='last', width=3 if active else 1,
                                fill='#c86817' if active else '#74889b')
@@ -230,7 +230,7 @@ class SimulatorWindow:
                 canvas.create_text(x+12,cy+13,anchor='w',text=text,font=('Consolas',10),fill='#26364b')
 
     def draw_slots(self):
-        state=self.container.history[self.view]
+        state=self.simulator.history[self.view]
         c=state['channels'][self.selected_channel]
         link=next(l for l in c['links'] if l['source']==self.selected_source)
         b=link['buffer']
@@ -251,7 +251,7 @@ class SimulatorWindow:
                 canvas.create_text(x+(sw-5)/2,53,text=values[:24],font=('Consolas',9),fill='#26364b')
 
 
-def launch(container):
+def launch(simulator: RingAllReduceSimulator):
     root=tk.Tk()
-    SimulatorWindow(root,container)
+    SimulatorWindow(root,simulator)
     root.mainloop()

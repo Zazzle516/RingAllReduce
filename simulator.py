@@ -86,11 +86,12 @@ class SimpleBuffer:
                 "slots": [p.to_dict() if p else None for p in self.slots]}
 
 
-@dataclass(frozen=True)
+@dataclass
 class GPU:
     rank: int
     numa_node: int
     input_values: tuple[Real, ...]
+    channels: dict[int, GPUChannelState] = field(default_factory=dict, init=False)
 
     @property
     def name(self):
@@ -115,51 +116,182 @@ class PCIeLink:
     recv_status: str = "READY"
 
 
+@dataclass(frozen=True)
 class Channel:
-    """Own a disjoint input range, four chunks per rank, and four FIFOs."""
-    def __init__(self, channel_id, start, stop, container):
-        self.id, self.start, self.stop = channel_id, start, stop
-        self.chunk_size = (stop - start + 3) // 4
-        self.padded_size = 4 * self.chunk_size
-        self.parts = (self.chunk_size + container.slice_elements - 1) // container.slice_elements
-        self.original = {}
-        self.data = {}
-        for rank, gpu in container.gpus.items():
-            values = gpu.input_values[start:stop] + (0,) * (self.padded_size-(stop-start))
-            self.original[rank] = values
-            self.data[rank] = []
-            for chunk in range(4):
-                slices = []
-                for part, offset in enumerate(range(0, self.chunk_size, container.slice_elements)):
-                    first = chunk*self.chunk_size + offset
-                    end = min(first+container.slice_elements, (chunk+1)*self.chunk_size)
-                    slices.append(Slice(self.id, chunk, part, offset, values[first:end], frozenset({rank})))
-                self.data[rank].append(slices)
-        self.links = {}
-        for pos, source in enumerate(container.ring):
-            target = container.ring[(pos+1) % 4]
-            n0, n1 = container.numa_nodes[source], container.numa_nodes[target]
-            route = f"NUMA {n0} / PCIe" if n0 == n1 else f"NUMA {n0} -> CPU interconnect -> NUMA {n1}"
-            period = container.receive_periods.get((self.id, target),
-                         container.receive_period if target == container.slow_rank else 1)
-            link = PCIeLink(source, target, route,
-                            SimpleBuffer(container.buffer_slots, container.slice_elements), period)
-            if not self.parts:
-                link.send_round = link.recv_round = 7
-                link.send_status = link.recv_status = "DONE"
-            self.links[source] = link
+    """Immutable partition and ring plan; device data lives on each GPU."""
+    id: int
+    start: int
+    stop: int
+    ring: tuple[int, ...]
+    slice_elements: int
 
     @property
-    def completed_round(self):
-        return min(link.recv_round-1 for link in self.links.values())
+    def chunk_size(self):
+        return (self.stop - self.start + 3) // 4
+
+    @property
+    def padded_size(self):
+        return 4 * self.chunk_size
+
+    @property
+    def parts(self):
+        return (self.chunk_size + self.slice_elements - 1) // self.slice_elements
+
+    def chunk_index(self, source, round_id):
+        offset = round_id if round_id <= 3 else round_id - 4
+        return self.ring[(self.ring.index(source) - offset) % 4]
+
+
+@dataclass
+class GPUChannelState:
+    """One GPU's local memory and connections for one channel.
+
+    recv_buffer belongs here. The upstream send_link and this recv_link
+    reference the SAME connection, whose buffer references this recv_buffer.
+    """
+    original: tuple[Real, ...]
+    data: list[list[Slice]]
+    recv_buffer: SimpleBuffer
+    send_link: PCIeLink | None = None
+    recv_link: PCIeLink | None = None
+
+    @classmethod
+    def create(cls, gpu, channel, buffer_slots):
+        values = gpu.input_values[channel.start:channel.stop]
+        values += (0,) * (channel.padded_size - len(values))
+        chunks = []
+        for chunk in range(4):
+            slices = []
+            for part, offset in enumerate(range(0, channel.chunk_size, channel.slice_elements)):
+                first = chunk * channel.chunk_size + offset
+                end = min(first + channel.slice_elements, (chunk + 1) * channel.chunk_size)
+                slices.append(Slice(channel.id, chunk, part, offset,
+                                    values[first:end], frozenset({gpu.rank})))
+            chunks.append(slices)
+        return cls(values, chunks, SimpleBuffer(buffer_slots, channel.slice_elements))
+
+    def attempt(self, channel, action, tick):
+        """Execute one local send or receive attempt; return an event."""
+        link = self.send_link if action == "send" else self.recv_link
+        assert link is not None
+        source = link.source
+        b = link.buffer
+        rnd = link.send_round if action == "send" else link.recv_round
+        if rnd > 6:
+            return None
+        event = {"channel": channel.id, "source": source, "target": link.target,
+                 "actor": action, "round": rnd, "tick": tick,
+                 "phase": "ReduceScatter" if rnd <= 3 else "AllGather",
+                 "before": {"head": b.head, "tail": b.tail}}
+        if action == "send":
+            k, part = channel.chunk_index(source, rnd), link.send_part
+            event.update(chunk=k, part=part)
+            packet = self.data[k][part]
+            if b.full:
+                event["kind"] = "WAIT_FULL"
+            elif rnd > 1 and packet.round != rnd-1:
+                event["kind"] = "WAIT_DEPENDENCY"
+            else:
+                assert len(packet.contributors) == min(rnd, 4)
+                outgoing = Slice(channel.id, k, part, packet.offset, packet.values, packet.contributors, rnd)
+                event.update(kind="SEND", slot=b.push(outgoing), payload=outgoing.to_dict())
+                link.elements_sent += len(outgoing.values)
+                link.send_part += 1
+                if link.send_part == channel.parts:
+                    link.send_part = 0
+                    link.send_round += 1
+            link.send_status = event["kind"]
+        else:
+            event.update(chunk=channel.chunk_index(source, rnd), part=link.recv_part)
+            if b.empty:
+                event["kind"] = "WAIT_EMPTY"
+            elif tick % link.receive_period:
+                event["kind"] = "WAIT_DELAY"
+            else:
+                packet = b.peek()
+                assert (packet.round, packet.part, packet.chunk) == (rnd, link.recv_part, event["chunk"])
+                values, contributors = packet.values, packet.contributors
+                if rnd <= 3:
+                    assert link.target not in contributors
+                    begin = packet.chunk*channel.chunk_size + packet.offset
+                    local = self.original[begin:begin+len(values)]
+                    values = tuple(a+v for a, v in zip(values, local))
+                    contributors = contributors | {link.target}
+                else:
+                    assert len(contributors) == 4
+                result = Slice(channel.id, packet.chunk, packet.part, packet.offset,
+                               values, frozenset(contributors), rnd)
+                self.data[packet.chunk][packet.part] = result
+                slot = b.head % b.capacity
+                b.pop()  # Release only after consuming and storing the result.
+                event.update(kind="RECV_REDUCE" if rnd <= 3 else "RECV_COPY",
+                             slot=slot, payload=packet.to_dict(), result=result.to_dict())
+                link.recv_part += 1
+                if link.recv_part == channel.parts:
+                    link.recv_part = 0
+                    link.recv_round += 1
+            link.recv_status = event["kind"]
+        event["after"] = {"head": b.head, "tail": b.tail}
+        return event
+
+
+class Scheduler:
+    """Fair single-thread event scheduler; has no reference to RingAllReduceSimulator.
+
+    It borrows GPUs and channel plans, advancing their local state one attempt
+    at a time. A sweep is a scheduling unit, not hardware time or a barrier.
+    """
+    def __init__(self, gpus, channels):
+        self.gpus, self.channels = gpus, channels
+        self.actors = [(c.id, r, action) for action in ("send", "recv")
+                       for r in channels[0].ring for c in channels]
+        self.cursor = self.sweep = self.event_id = 0
+        self.last_event = None
+        self.counts = {}
+
+    def links(self, channel_id):
+        for source in self.channels[channel_id].ring:
+            yield self.gpus[source].channels[channel_id].send_link
+
+    def completed_round(self, channel_id):
+        return min(link.recv_round - 1 for link in self.links(channel_id))
 
     @property
     def done(self):
-        return self.completed_round == 6
+        return all(self.completed_round(c.id) == 6 for c in self.channels)
+
+    @property
+    def round(self):
+        return min(self.completed_round(c.id) for c in self.channels)
+
+    def step_event(self):
+        if self.done:
+            raise StopIteration("All channels have completed AllReduce")
+        if any(not link.p2p_enabled for c in self.channels for link in self.links(c.id)):
+            raise RuntimeError("P2P unavailable; no host fallback is modelled")
+        while True:
+            c, source, action = self.actors[self.cursor]
+            tick = self.sweep
+            self.cursor = (self.cursor + 1) % len(self.actors)
+            if self.cursor == 0:
+                self.sweep += 1
+            sender = self.gpus[source].channels[c]
+            rank = source if action == "send" else sender.send_link.target
+            event = self.gpus[rank].channels[c].attempt(self.channels[c], action, tick)
+            if event is not None:
+                break
+        self.event_id += 1
+        event["id"] = self.event_id
+        self.last_event = event
+        self.counts[event["kind"]] = self.counts.get(event["kind"], 0) + 1
+        return event
 
 
-class GPUContainer:
-    """Four GPUs, independent channels and a fair single-thread event scheduler.
+class RingAllReduceSimulator:
+    """Assemble the simulation, manage its lifecycle, and expose GUI/CLI APIs.
+
+    GPUs own local channel state. Scheduler advances communication events.
+    This facade records snapshots, assembles results and verifies them.
 
     Each scheduler sweep offers every active sender/receiver one turn. A slow
     receiver consumes only on sweeps divisible by its receive_period. One
@@ -213,25 +345,58 @@ class GPUContainer:
         start = 0
         for c in range(self.nchannels):
             stop = start + width + (c < extra)
-            self.channels.append(Channel(c, start, stop, self))
+            self.channels.append(Channel(c, start, stop, self.ring, self.slice_elements))
             start = stop
         self.padded_size = sum(c.padded_size for c in self.channels)
-        # Interleave channels at each ring position so neither owns the scheduler.
-        self.actors = [(c, r, action) for action in ("send", "recv")
-                       for r in self.ring for c in range(self.nchannels)]
-        self.cursor = self.sweep = self.event_id = 0
-        self.last_event = None
-        self.counts = {}
+        for gpu in self.gpus.values():
+            gpu.channels = {c.id: GPUChannelState.create(gpu, c, self.buffer_slots)
+                            for c in self.channels}
+        for c in self.channels:
+            for pos, source in enumerate(c.ring):
+                target = c.ring[(pos + 1) % 4]
+                sender = self.gpus[source].channels[c.id]
+                receiver = self.gpus[target].channels[c.id]
+                n0, n1 = self.gpus[source].numa_node, self.gpus[target].numa_node
+                route = (f"NUMA {n0} / PCIe" if n0 == n1 else
+                         f"NUMA {n0} -> CPU interconnect -> NUMA {n1}")
+                period = self.receive_periods.get((c.id, target),
+                             self.receive_period if target == self.slow_rank else 1)
+                link = PCIeLink(source, target, route, receiver.recv_buffer, period)
+                if not c.parts:
+                    link.send_round = link.recv_round = 7
+                    link.send_status = link.recv_status = "DONE"
+                sender.send_link = receiver.recv_link = link
+        self.scheduler = Scheduler(self.gpus, self.channels)
         self.history = [self.snapshot()]
 
     @property
     def done(self):
-        return all(c.done for c in self.channels)
+        return self.scheduler.done
 
     @property
     def round(self):
         """Minimum fully received round across active channels; for display only."""
-        return min(c.completed_round for c in self.channels)
+        return self.scheduler.round
+
+    @property
+    def event_id(self):
+        return self.scheduler.event_id
+
+    @property
+    def last_event(self):
+        return self.scheduler.last_event
+
+    @property
+    def counts(self):
+        return self.scheduler.counts
+
+    @property
+    def cursor(self):
+        return self.scheduler.cursor
+
+    @property
+    def sweep(self):
+        return self.scheduler.sweep
 
     @property
     def expected(self):
@@ -245,93 +410,13 @@ class GPUContainer:
         for rank in range(4):
             result[rank] = []
             for c in self.channels:
-                values = [v for chunk in c.data[rank] for packet in chunk for v in packet.values]
+                values = [v for chunk in self.gpus[rank].channels[c.id].data for packet in chunk for v in packet.values]
                 result[rank].extend(values[:c.stop-c.start])
         return result
 
-    def _chunk_index(self, source, round_id):
-        offset = round_id if round_id <= 3 else round_id-4
-        return self.ring[(self.ring.index(source)-offset) % 4]
-
-    def _attempt(self, channel, source, action, tick):
-        link = channel.links[source]
-        b = link.buffer
-        rnd = link.send_round if action == "send" else link.recv_round
-        if rnd > 6:
-            return None
-        event = {"channel": channel.id, "source": source, "target": link.target,
-                 "actor": action, "round": rnd, "tick": tick,
-                 "phase": "ReduceScatter" if rnd <= 3 else "AllGather",
-                 "before": {"head": b.head, "tail": b.tail}}
-        if action == "send":
-            k, part = self._chunk_index(source, rnd), link.send_part
-            event.update(chunk=k, part=part)
-            packet = channel.data[source][k][part]
-            if b.full:
-                event["kind"] = "WAIT_FULL"
-            elif rnd > 1 and packet.round != rnd-1:
-                event["kind"] = "WAIT_DEPENDENCY"
-            else:
-                assert len(packet.contributors) == min(rnd, 4)
-                outgoing = Slice(channel.id, k, part, packet.offset, packet.values, packet.contributors, rnd)
-                event.update(kind="SEND", slot=b.push(outgoing), payload=outgoing.to_dict())
-                link.elements_sent += len(outgoing.values)
-                link.send_part += 1
-                if link.send_part == channel.parts:
-                    link.send_part = 0
-                    link.send_round += 1
-            link.send_status = event["kind"]
-        else:
-            event.update(chunk=self._chunk_index(source, rnd), part=link.recv_part)
-            if b.empty:
-                event["kind"] = "WAIT_EMPTY"
-            elif tick % link.receive_period:
-                event["kind"] = "WAIT_DELAY"
-            else:
-                packet = b.peek()
-                assert (packet.round, packet.part, packet.chunk) == (rnd, link.recv_part, event["chunk"])
-                values, contributors = packet.values, packet.contributors
-                if rnd <= 3:
-                    assert link.target not in contributors
-                    begin = packet.chunk*channel.chunk_size + packet.offset
-                    local = channel.original[link.target][begin:begin+len(values)]
-                    values = tuple(a+v for a, v in zip(values, local))
-                    contributors = contributors | {link.target}
-                else:
-                    assert len(contributors) == 4
-                result = Slice(channel.id, packet.chunk, packet.part, packet.offset,
-                               values, frozenset(contributors), rnd)
-                channel.data[link.target][packet.chunk][packet.part] = result
-                slot = b.head % b.capacity
-                b.pop()  # Release only after consuming and storing the result.
-                event.update(kind="RECV_REDUCE" if rnd <= 3 else "RECV_COPY",
-                             slot=slot, payload=packet.to_dict(), result=result.to_dict())
-                link.recv_part += 1
-                if link.recv_part == channel.parts:
-                    link.recv_part = 0
-                    link.recv_round += 1
-            link.recv_status = event["kind"]
-        event["after"] = {"head": b.head, "tail": b.tail}
-        return event
-
     def step_event(self):
-        if self.done:
-            raise StopIteration("All channels have completed AllReduce")
-        if any(not link.p2p_enabled for c in self.channels for link in c.links.values()):
-            raise RuntimeError("P2P unavailable; no host fallback is modelled")
-        while True:
-            c, source, action = self.actors[self.cursor]
-            tick = self.sweep
-            self.cursor = (self.cursor+1) % len(self.actors)
-            if self.cursor == 0:
-                self.sweep += 1
-            event = self._attempt(self.channels[c], source, action, tick)
-            if event is not None:
-                break
-        self.event_id += 1
-        event["id"] = self.event_id
-        self.last_event = event
-        self.counts[event["kind"]] = self.counts.get(event["kind"], 0)+1
+        """Advance the scheduler, then record a GUI/JSON snapshot."""
+        event = self.scheduler.step_event()
         if self.record_history:
             state = self.snapshot()
             self.history.append(state)
@@ -367,7 +452,8 @@ class GPUContainer:
         channels = []
         for c in self.channels:
             devices = {}
-            for rank, chunks in c.data.items():
+            for rank, gpu in self.gpus.items():
+                chunks = gpu.channels[c.id].data
                 devices[str(rank)] = {"name": self.gpus[rank].name, "numa": self.numa_nodes[rank],
                     "chunks": [{"index": k, "values": [v for p in parts for v in p.values],
                                 "slices": [p.to_dict() for p in parts],
@@ -375,7 +461,7 @@ class GPUContainer:
                                 "complete": bool(parts) and all(len(p.contributors) == 4 for p in parts)}
                                for k, parts in enumerate(chunks)]}
             links = []
-            for link in c.links.values():
+            for link in self.scheduler.links(c.id):
                 links.append({"source": link.source, "target": link.target, "route": link.route,
                               "buffer": link.buffer.to_dict(), "elements_sent": link.elements_sent,
                               "send_round": link.send_round, "send_part": link.send_part,
@@ -384,7 +470,7 @@ class GPUContainer:
                               "send_status": link.send_status, "recv_status": link.recv_status})
             channels.append({"id": c.id, "start": c.start, "stop": c.stop,
                              "chunk_size": c.chunk_size, "parts": c.parts,
-                             "completed_round": c.completed_round, "gpus": devices, "links": links})
+                             "completed_round": self.scheduler.completed_round(c.id), "gpus": devices, "links": links})
         # All nested mutable collections are new; history never shares live FIFO storage.
         import copy
         return {"event_id": self.event_id, "tick": self.last_event['tick'] if self.last_event else 0,

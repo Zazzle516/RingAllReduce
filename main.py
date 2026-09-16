@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sys
 
-from simulator import GPUContainer, demo_inputs
+from simulator import RingAllReduceSimulator, demo_inputs
 
 
 def format_event(state):
@@ -40,33 +40,33 @@ def main():
         parser.error('--step/--rounds/--export/--quiet require --cli')
     try:
         data = json.loads(args.input.read_text(encoding='utf-8-sig')) if args.input else demo_inputs()
-        sim = GPUContainer(data, nchannels=args.channels, buffer_slots=args.buffer_slots,
+        simulator = RingAllReduceSimulator(data, nchannels=args.channels, buffer_slots=args.buffer_slots,
                            slice_elements=args.slice_elements, slow_rank=args.slow_rank,
                            receive_period=args.receive_period,
                            record_history=not args.cli or bool(args.export))
     except (ValueError, TypeError, OSError, KeyError) as exc:
         parser.error(str(exc))
     if args.cli:
-        print(f"CPU simulation | {sim.nchannels} channels | slots={sim.buffer_slots} | "
-              f"slice elements={sim.slice_elements} | input/padded={sim.size}/{sim.padded_size}")
-        for c in sim.channels:
+        print(f"CPU simulation | {simulator.nchannels} channels | slots={simulator.buffer_slots} | "
+              f"slice elements={simulator.slice_elements} | input/padded={simulator.size}/{simulator.padded_size}")
+        for c in simulator.channels:
             print(f"Channel {c.id}: [{c.start}, {c.stop}), chunk={c.chunk_size}, slices/chunk={c.parts}")
-        while not sim.done:
+        while not simulator.done:
             if args.step:
                 input('Enter: next ' + ('round milestone' if args.rounds else 'event') + '...')
-            state = sim.step_round() if args.rounds else sim.step_event()
+            state = simulator.step_round() if args.rounds else simulator.step_event()
             if not args.quiet:
                 print(format_event(state))
                 if args.rounds:
-                    print(f"All channels have completed at least round {sim.round}")
-        ok = sim.verify()
+                    print(f"All channels have completed at least round {simulator.round}")
+        ok = simulator.verify()
         print('Verification: ' + ('PASS' if ok else 'FAIL'))
-        print('Result:', sim.results[0])
-        print('Events:', sim.event_id, sim.counts)
-        print('Sent elements per GPU:', {r: sum(c.links[r].elements_sent for c in sim.channels) for r in sim.ring})
+        print('Result:', simulator.results[0])
+        print('Events:', simulator.event_id, simulator.counts)
+        print('Sent elements per GPU:', {r: sum(simulator.gpus[r].channels[c.id].send_link.elements_sent for c in simulator.channels) for r in simulator.ring})
         if args.export:
             args.export.parent.mkdir(parents=True, exist_ok=True)
-            args.export.write_text(json.dumps(sim.trace(), ensure_ascii=False, indent=2), encoding='utf-8')
+            args.export.write_text(json.dumps(simulator.trace(), ensure_ascii=False, indent=2), encoding='utf-8')
             print('Trace:', args.export.resolve())
         return 0 if ok else 1
     try:
@@ -74,7 +74,7 @@ def main():
     except ImportError:
         print('Tkinter unavailable. Use python main.py --cli', file=sys.stderr)
         return 1
-    launch(sim)
+    launch(simulator)
     return 0
 
 

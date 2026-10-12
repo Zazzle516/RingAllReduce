@@ -5,7 +5,7 @@
       "name": "RingAllReduce 图形模拟器",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/main.py",
+      "program": "${workspaceFolder}/AllReduce/main.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true
@@ -14,7 +14,7 @@
       "name": "RingAllReduce 命令行逐事件运行",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/main.py",
+      "program": "${workspaceFolder}/AllReduce/main.py",
       "args": [
         "--cli",
         "--step"
@@ -22,6 +22,27 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true
+    },
+    {
+      "name": "RingAllGather 图形模拟器",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/AllGather/main.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "RingAllGather 命令行运行",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/AllGather/main.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--cli"
+      ]
     }
   ]
 }

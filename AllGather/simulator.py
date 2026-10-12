@@ -1,6 +1,7 @@
 """单 channel Ring AllGather 教学模拟：只复制和转发，不做归约。
 
-运行：python all-gather-sim.py
+图形界面：python AllGather/main.py
+终端输出：python AllGather/main.py --cli
 为便于观察，这里按同步轮次推进，不模拟真实 GPU 或异步流水线。
 """
 
@@ -15,12 +16,11 @@ class GPU:
     blocks: list[tuple[int, ...] | None]
 
 
-def all_gather(
+def gather_rounds(
     inputs: Sequence[Sequence[int]],
     ring: Sequence[int] = (0, 3, 2, 1),
-    verbose: bool = True,
-) -> list[list[int]]:
-    """返回按接收 rank 排列的结果，每份结果内部按来源 rank 拼接。
+):
+    """逐轮生成独立快照，GUI 和终端共用同一个算法。
 
     ring 只决定传输路径，不改变输出的数据排列顺序。
     每张 GPU 的输入长度必须相同；每轮沿环发送一个完整数据块。
@@ -35,20 +35,13 @@ def all_gather(
     for gpu, values in zip(gpus, inputs):
         gpu.blocks[gpu.rank] = tuple(values)
 
-    def show_state():
-        for gpu in gpus:
-            blocks = [list(block) if block is not None else None for block in gpu.blocks]
-            print(f"  GPU {gpu.rank}: {blocks}")
+    def snapshot(round_id, transfers):
+        return {"round": round_id, "transfers": tuple(transfers),
+                "blocks": tuple(tuple(gpu.blocks) for gpu in gpus)}
 
-    if verbose:
-        print("环路径：" + " -> ".join(map(str, (*ring, ring[0]))))
-        print("初始状态（槽位按来源 rank 排列，None 表示未收到）：")
-        show_state()
+    yield snapshot(0, [])
 
     for step in range(nranks - 1):
-        if verbose:
-            print(f"\n第 {step + 1} 轮：")
-
         # 先收集本轮所有发送，再统一接收，避免同一块在一轮内跨越多跳。
         transfers = []
         for position, source in enumerate(ring):
@@ -57,21 +50,33 @@ def all_gather(
             owner = ring[(position - step) % nranks]
             block = gpus[source].blocks[owner]
             assert block is not None, "发送前必须已经拥有该块"
-            transfers.append((target, owner, block))
-            if verbose:
-                print(f"  GPU {source} -> GPU {target}: 来源 GPU {owner}，数据 {list(block)}")
+            transfers.append((source, target, owner, block))
 
-        for target, owner, block in transfers:
+        for source, target, owner, block in transfers:
             assert gpus[target].blocks[owner] is None, "每个来源的块只应接收一次"
             gpus[target].blocks[owner] = block  # 不可变 tuple；逻辑上复制，无加法。
 
+        yield snapshot(step + 1, transfers)
+
+
+def all_gather(
+    inputs: Sequence[Sequence[int]],
+    ring: Sequence[int] = (0, 3, 2, 1),
+    verbose: bool = True,
+) -> list[list[int]]:
+    """运行全部轮次，保留终端/API 用法；输出按来源 rank 拼接。"""
+    for state in gather_rounds(inputs, ring):
         if verbose:
-            show_state()
+            print(f"\n第 {state['round']} 轮（0 为初始状态）：")
+            for source, target, owner, block in state["transfers"]:
+                print(f"  GPU {source} -> GPU {target}: 来源 GPU {owner}，数据 {list(block)}")
+            for rank, blocks in enumerate(state["blocks"]):
+                print(f"  GPU {rank}: {[list(b) if b is not None else None for b in blocks]}")
 
     results = []
-    for gpu in gpus:
+    for blocks in state["blocks"]:
         row = []
-        for block in gpu.blocks:
+        for block in blocks:
             assert block is not None, "结束时必须拥有全部来源的数据块"
             row.extend(block)
         results.append(row)
@@ -82,14 +87,9 @@ def all_gather(
         print("\n最终结果（按来源 rank 拼接）：")
         for rank, row in enumerate(results):
             print(f"  GPU {rank}: {row}")
-        print(f"验证通过：{nranks - 1} 轮后，每张 GPU 都拥有全部输入。")
+        print(f"验证通过：{len(inputs) - 1} 轮后，每张 GPU 都拥有全部输入。")
     return results
 
 
-if __name__ == "__main__":
-    all_gather([
-        [10, 11],  # GPU 0
-        [20, 21],  # GPU 1
-        [30, 31],  # GPU 2
-        [40, 41],  # GPU 3
-    ])
+DEMO_INPUTS = ((10, 11), (20, 21), (30, 31), (40, 41))
+DEMO_RING = (0, 3, 2, 1)

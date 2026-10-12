@@ -3,8 +3,8 @@ import json
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from simulator import RingAllReduceSimulator
-from main import format_event
+from AllReduce.simulator import RingAllReduceSimulator
+from AllReduce.main import format_event
 
 LABELS = {'SEND': '写入并发布 tail', 'RECV_REDUCE': '接收＋归约，释放 head',
           'RECV_COPY': '接收＋复制，释放 head', 'WAIT_FULL': '发送等待：Buffer 满',

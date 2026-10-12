@@ -3,7 +3,7 @@ import json
 import random
 import unittest
 
-from simulator import RingAllReduceSimulator, SimpleBuffer, Slice, demo_inputs
+from AllReduce.simulator import RingAllReduceSimulator, SimpleBuffer, Slice, demo_inputs
 
 
 class AlgorithmTests(unittest.TestCase):

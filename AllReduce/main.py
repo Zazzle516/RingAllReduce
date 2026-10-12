@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 import sys
 
-from simulator import RingAllReduceSimulator, demo_inputs
+# 支持从任意工作目录直接运行此文件，也支持 python -m AllReduce
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from AllReduce.simulator import RingAllReduceSimulator, demo_inputs
 
 
 def format_event(state):
@@ -70,9 +74,9 @@ def main():
             print('Trace:', args.export.resolve())
         return 0 if ok else 1
     try:
-        from gui import launch
+        from AllReduce.gui import launch
     except ImportError:
-        print('Tkinter unavailable. Use python main.py --cli', file=sys.stderr)
+        print('Tkinter unavailable. Use python -m AllReduce --cli', file=sys.stderr)
         return 1
     launch(simulator)
     return 0
